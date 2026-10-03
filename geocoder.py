@@ -294,6 +294,7 @@ class BatchGeocoderEngine:
         self.total_rows = len(self.df)
         already_processed = self.df["Geocode_Status"].isin(["success", "not_found", "empty_address"]).sum()
         self.processed_count = int(already_processed)
+        self.start_processed_count = self.processed_count
         self.success_count = int((self.df["Geocode_Status"] == "success").sum())
         self.failed_count = int((self.df["Geocode_Status"].isin(["not_found", "empty_address"]) | 
                                  self.df["Geocode_Status"].str.startswith("http_") |
@@ -302,6 +303,13 @@ class BatchGeocoderEngine:
 
         self.start_time = None
         self.last_checkpoint_save = self.processed_count
+        self._executor = None
+        self.recent_logs = []
+
+    def get_recent_logs(self) -> list:
+        """Returns the most recent geocoded address activities."""
+        with self.lock:
+            return list(self.recent_logs)
 
     def load_checkpoint(self):
         """Loads state from existing checkpoint file."""
@@ -328,6 +336,7 @@ class BatchGeocoderEngine:
     def process_batch(self, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> pd.DataFrame:
         """Executes batch geocoding process and updates UI callback periodically."""
         self.start_time = time.time()
+        self.start_processed_count = self.processed_count
         
         pending_mask = self.df["Geocode_Status"] == "pending"
         pending_indices = self.df[pending_mask].index.tolist()
@@ -351,10 +360,15 @@ class BatchGeocoderEngine:
             return idx, lat, lng, status
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            self._executor = executor
             futures = {executor.submit(_worker, idx): idx for idx in pending_indices}
 
             for count, future in enumerate(as_completed(futures), 1):
                 if self.stop_requested:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
                     break
                 try:
                     idx, lat, lng, status = future.result()
@@ -369,11 +383,26 @@ class BatchGeocoderEngine:
                         else:
                             self.failed_count += 1
 
+                        addr_str = str(self.df.at[idx, self.address_col]) if pd.notna(self.df.at[idx, self.address_col]) else ""
+                        if len(addr_str) > 45:
+                            addr_str = addr_str[:42] + "..."
+                        
+                        coords_str = f"{lat:.4f}, {lng:.4f}" if (lat is not None and lng is not None) else "-"
+                        self.recent_logs.append({
+                            "row": idx + 1,
+                            "address": addr_str,
+                            "coords": coords_str,
+                            "status": status,
+                            "time": time.strftime("%H:%M:%S")
+                        })
+                        if len(self.recent_logs) > 6:
+                            self.recent_logs.pop(0)
+
                     if (self.processed_count - self.last_checkpoint_save) >= self.checkpoint_interval:
                         self.save_checkpoint()
                         self.last_checkpoint_save = self.processed_count
 
-                    refresh_step = 1 if self.provider == "OpenStreetMap (Nominatim)" else 10
+                    refresh_step = 1 if self.provider == "OpenStreetMap (Nominatim)" else 5
                     if progress_callback and (count % refresh_step == 0 or count == len(pending_indices)):
                         progress_callback(self.get_metrics())
 
@@ -387,8 +416,13 @@ class BatchGeocoderEngine:
         return self.df
 
     def stop(self):
-        """Requests process cancellation."""
+        """Requests process cancellation and cancels queued threads."""
         self.stop_requested = True
+        if hasattr(self, "_executor") and self._executor:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     def get_metrics(self) -> Dict[str, Any]:
         """Calculates current metrics for stream updating."""
@@ -398,7 +432,8 @@ class BatchGeocoderEngine:
             total = self.total_rows
             remaining = total - processed
 
-            speed = processed / elapsed if elapsed > 0 else 0.0
+            rows_in_this_run = max(0, processed - getattr(self, "start_processed_count", 0))
+            speed = rows_in_this_run / elapsed if elapsed > 0 else 0.0
 
             if speed > 0 and remaining > 0:
                 eta_sec = remaining / speed
@@ -421,5 +456,175 @@ class BatchGeocoderEngine:
                 "failed": self.failed_count,
                 "speed": round(speed, 2),
                 "eta": eta_str,
-                "percentage": round(pct, 1)
+                "percentage": round(pct, 1),
+                "elapsed": round(elapsed, 1)
             }
+
+
+class GeocodeTaskManager:
+    """
+    Global thread-safe manager for background geocoding tasks.
+    Ensures that tasks persist across browser reloads (F5) and tab closures.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "idle"  # idle, running, stopping, stopped, completed, error
+        self.error_message: Optional[str] = None
+        self.engine: Optional[BatchGeocoderEngine] = None
+        self.thread: Optional[threading.Thread] = None
+        self.filename: str = ""
+        self.address_col: str = ""
+        self.provider: str = ""
+        self.api_key: str = ""
+        self.delay_seconds: float = 3.0
+        self.max_workers: int = 5
+        self.checkpoint_interval: int = 100
+        self.df_result: Optional[pd.DataFrame] = None
+        self.start_time: Optional[float] = None
+        self.end_time: Optional[float] = None
+
+    def is_running(self) -> bool:
+        with self.lock:
+            return self.status in ("running", "stopping")
+
+    def start_task(
+        self,
+        df: pd.DataFrame,
+        address_col: str,
+        provider: str,
+        api_key: str = "",
+        delay_seconds: float = 3.0,
+        max_workers: int = 5,
+        checkpoint_interval: int = 100,
+        resume_from_checkpoint: bool = False,
+        filename: str = ""
+    ) -> bool:
+        with self.lock:
+            if self.status in ("running", "stopping"):
+                return False
+
+            self.status = "running"
+            self.error_message = None
+            self.filename = filename or "data_geocoded"
+            self.address_col = address_col
+            self.provider = provider
+            self.api_key = api_key
+            self.delay_seconds = delay_seconds
+            self.max_workers = max_workers
+            self.checkpoint_interval = checkpoint_interval
+            self.start_time = time.time()
+            self.end_time = None
+            self.df_result = None
+
+            self.engine = BatchGeocoderEngine(
+                df=df,
+                address_col=address_col,
+                provider=provider,
+                api_key=api_key,
+                delay_seconds=delay_seconds,
+                max_workers=max_workers,
+                checkpoint_interval=checkpoint_interval,
+                resume_from_checkpoint=resume_from_checkpoint
+            )
+
+        def _run():
+            try:
+                res = self.engine.process_batch()
+                with self.lock:
+                    self.df_result = res
+                    self.end_time = time.time()
+                    if self.engine.stop_requested:
+                        self.status = "stopped"
+                    else:
+                        self.status = "completed"
+            except Exception as e:
+                with self.lock:
+                    self.status = "error"
+                    self.error_message = str(e)
+                    self.end_time = time.time()
+
+        self.thread = threading.Thread(target=_run, daemon=True)
+        self.thread.start()
+        return True
+
+    def stop_task(self):
+        with self.lock:
+            if self.engine and self.status == "running":
+                self.status = "stopping"
+                self.engine.stop()
+
+    def resume_task(self) -> bool:
+        with self.lock:
+            if self.status != "stopped" or self.engine is None:
+                return False
+            df = self.engine.df
+            address_col = self.address_col
+            provider = self.provider
+            api_key = self.api_key
+            delay_seconds = self.delay_seconds
+            max_workers = self.max_workers
+            checkpoint_interval = self.checkpoint_interval
+            filename = self.filename
+
+        return self.start_task(
+            df=df,
+            address_col=address_col,
+            provider=provider,
+            api_key=api_key,
+            delay_seconds=delay_seconds,
+            max_workers=max_workers,
+            checkpoint_interval=checkpoint_interval,
+            resume_from_checkpoint=False,
+            filename=filename
+        )
+
+    def reset_task(self):
+        with self.lock:
+            if self.status not in ("running", "stopping"):
+                self.status = "idle"
+                self.error_message = None
+                self.engine = None
+                self.thread = None
+                self.filename = ""
+                self.address_col = ""
+                self.provider = ""
+                self.df_result = None
+                self.start_time = None
+                self.end_time = None
+
+    def get_info(self) -> Dict[str, Any]:
+        with self.lock:
+            status = self.status
+            error_msg = self.error_message
+            filename = self.filename
+            address_col = self.address_col
+            provider = self.provider
+            api_key = self.api_key
+            delay_seconds = self.delay_seconds
+            max_workers = self.max_workers
+            checkpoint_interval = self.checkpoint_interval
+            engine = self.engine
+            df_result = self.df_result
+
+        metrics = engine.get_metrics() if engine else {
+            "processed": 0, "total": 0, "success": 0, "failed": 0,
+            "speed": 0.0, "eta": "--:--", "percentage": 0.0, "elapsed": 0.0
+        }
+        recent_logs = engine.get_recent_logs() if engine else []
+        current_df = df_result if df_result is not None else (engine.df if engine else None)
+
+        return {
+            "status": status,
+            "error_message": error_msg,
+            "filename": filename,
+            "address_col": address_col,
+            "provider": provider,
+            "api_key": api_key,
+            "delay_seconds": delay_seconds,
+            "max_workers": max_workers,
+            "checkpoint_interval": checkpoint_interval,
+            "metrics": metrics,
+            "recent_logs": recent_logs,
+            "df": current_df
+        }
+

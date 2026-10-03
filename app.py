@@ -1,12 +1,13 @@
 import os
 import io
 import time
-import importlib
 import pandas as pd
 import streamlit as st
-import geocoder
-importlib.reload(geocoder)
-from geocoder import BatchGeocoderEngine, test_api_provider
+from geocoder import (
+    BatchGeocoderEngine,
+    GeocodeTaskManager,
+    test_api_provider
+)
 
 # Page Configuration
 st.set_page_config(
@@ -15,6 +16,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Global Persistent Task Manager (persists across browser reloads & tabs)
+@st.cache_resource
+def get_global_task_manager() -> GeocodeTaskManager:
+    return GeocodeTaskManager()
 
 # Custom Styling (Dark/Light Responsive Modern Interface)
 st.markdown("""
@@ -102,20 +108,61 @@ st.markdown("""
         margin-bottom: 16px;
         color: #FEF08A;
     }
+
+    .badge-running {
+        display: inline-block;
+        background: rgba(34, 197, 94, 0.18);
+        border: 1px solid #22C55E;
+        color: #4ADE80;
+        font-size: 0.82rem;
+        font-weight: 600;
+        padding: 3px 12px;
+        border-radius: 20px;
+        margin-left: 10px;
+        vertical-align: middle;
+        animation: pulse 2s infinite;
+    }
+
+    .badge-stopping {
+        display: inline-block;
+        background: rgba(234, 179, 8, 0.18);
+        border: 1px solid #EAB308;
+        color: #FBBF24;
+        font-size: 0.82rem;
+        font-weight: 600;
+        padding: 3px 12px;
+        border-radius: 20px;
+        margin-left: 10px;
+        vertical-align: middle;
+    }
+
+    .activity-box {
+        background: #0F172A;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 12px 16px;
+        margin-top: 14px;
+        margin-bottom: 20px;
+    }
+    
+    .activity-item {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.84rem;
+        color: #94A3B8;
+        padding: 5px 0;
+        border-bottom: 1px solid #1E293B;
+    }
+    .activity-item:last-child {
+        border-bottom: none;
+    }
+
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.55; }
+        100% { opacity: 1; }
+    }
     </style>
 """, unsafe_allow_html=True)
-
-
-def init_session_states():
-    """Initializes Streamlit session state variables."""
-    if "df_loaded" not in st.session_state:
-        st.session_state.df_loaded = None
-    if "geocoded_df" not in st.session_state:
-        st.session_state.geocoded_df = None
-    if "is_processing" not in st.session_state:
-        st.session_state.is_processing = False
-    if "geocoder_engine" not in st.session_state:
-        st.session_state.geocoder_engine = None
 
 
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
@@ -131,18 +178,311 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+@st.fragment(run_every="1s")
+def render_running_dashboard(task_mgr: GeocodeTaskManager):
+    """
+    Real-time progress dashboard rendered every 1 second without full page reload.
+    Survives browser refresh and updates smoothly.
+    """
+    info = task_mgr.get_info()
+    status = info["status"]
+
+    # When background task completes or stops, trigger parent app rerun to show results
+    if status in ("completed", "stopped", "error"):
+        st.rerun(scope="app")
+        return
+
+    metrics = info["metrics"]
+    pct = metrics.get("percentage", 0.0)
+    processed = metrics.get("processed", 0)
+    total = metrics.get("total", 0)
+    success = metrics.get("success", 0)
+    failed = metrics.get("failed", 0)
+    speed = metrics.get("speed", 0.0)
+    eta = metrics.get("eta", "--:--")
+
+    # Progress bar
+    st.progress(pct / 100.0, text=f"Kemajuan: {pct:.1f}% ({processed:,} / {total:,} baris)")
+
+    # 5 Metric Cards
+    metrics_html = f"""
+    <div class="metric-container">
+        <div class="metric-card">
+            <div class="metric-title">Baris Diproses</div>
+            <div class="metric-value">{processed:,} / {total:,}</div>
+            <div class="metric-subtitle">{pct:.1f}% Selesai</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Sukses Ditemukan</div>
+            <div class="metric-value status-success">{success:,}</div>
+            <div class="metric-subtitle">Koordinat Valid</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Gagal / Kosong</div>
+            <div class="metric-value status-failed">{failed:,}</div>
+            <div class="metric-subtitle">Gagal Geocode</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Kecepatan</div>
+            <div class="metric-value status-speed">{speed}</div>
+            <div class="metric-subtitle">Baris / Detik</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Estimasi Sisa Waktu (ETA)</div>
+            <div class="metric-value status-eta">{eta}</div>
+            <div class="metric-subtitle">Format J:M:S / M:S</div>
+        </div>
+    </div>
+    """
+    st.markdown(metrics_html, unsafe_allow_html=True)
+
+    # Real-Time Activity Feed (Last 6 processed rows)
+    recent_logs = info.get("recent_logs", [])
+    if recent_logs:
+        st.markdown("##### 📡 Aktivitas Geocoding Real-Time (Data Terakhir Diproses)")
+        log_rows_html = ""
+        for item in reversed(recent_logs):
+            badge_color = "#4ADE80" if item["status"] == "success" else "#F87171"
+            log_rows_html += f"""
+            <div class="activity-item">
+                <span style="color: #64748B;">[{item["time"]}]</span> 
+                <b style="color: #38BDF8;">Baris #{item["row"]}:</b> 
+                <span>{item["address"]}</span> 
+                <span style="color: {badge_color}; float: right;">[{item["status"]}] {item["coords"]}</span>
+            </div>
+            """
+        st.markdown(f'<div class="activity-box">{log_rows_html}</div>', unsafe_allow_html=True)
+
+    # Stop Button / Status Note
+    col_s1, col_s2 = st.columns([2, 5])
+    with col_s1:
+        if status == "stopping":
+            st.button("⏳ Menyimpan Checkpoint...", disabled=True, use_container_width=True)
+            st.caption("Sedang menghentikan thread & menyimpan progres ke checkpoint...")
+        else:
+            if st.button("🛑 Hentikan Proses", type="secondary", use_container_width=True, key="btn_stop_bg_proc"):
+                task_mgr.stop_task()
+                st.rerun(scope="app")
+    with col_s2:
+        if status == "running":
+            st.caption("💡 *Proses berjalan di background. Anda bebas me-refresh browser atau berpindah tab tanpa kehilangan data!*")
+
+
+def render_results_section(df: pd.DataFrame, subtitle: str = ""):
+    """Renders download buttons, table tab, and map tab for completed or stopped results."""
+    st.divider()
+    st.subheader("📊 Hasil & Unduh File Output")
+    if subtitle:
+        st.caption(subtitle)
+
+    col_dl1, col_dl2 = st.columns([1, 1])
+    with col_dl1:
+        csv_data = convert_df_to_csv(df)
+        st.download_button(
+            label="📥 Unduh Hasil Format CSV (.csv)",
+            data=csv_data,
+            file_name="hasil_geocoding.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    with col_dl2:
+        try:
+            excel_data = convert_df_to_excel(df)
+            st.download_button(
+                label="📊 Unduh Hasil Format Excel (.xlsx)",
+                data=excel_data,
+                file_name="hasil_geocoding.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"Gagal menyiapkan file Excel: {e}")
+
+    tab_t, tab_m = st.tabs(["📋 Tabel Hasil Geocoding", "🗺️ Visualisasi Peta"])
+
+    with tab_t:
+        st.dataframe(df, use_container_width=True)
+
+    with tab_m:
+        if "Latitude" in df.columns and "Longitude" in df.columns:
+            valid_coords = df.dropna(subset=["Latitude", "Longitude"]).copy()
+            valid_coords["latitude"] = pd.to_numeric(valid_coords["Latitude"], errors='coerce')
+            valid_coords["longitude"] = pd.to_numeric(valid_coords["Longitude"], errors='coerce')
+            valid_coords = valid_coords.dropna(subset=["latitude", "longitude"])
+
+            if not valid_coords.empty:
+                st.write(f"Menampilkan **{len(valid_coords):,} titik lokasi** sukses pada peta:")
+                st.map(valid_coords[["latitude", "longitude"]], zoom=5)
+            else:
+                st.info("Belum ada koordinat valid untuk ditampilkan pada peta.")
+
+
 def main():
-    init_session_states()
+    task_mgr = get_global_task_manager()
+    task_info = task_mgr.get_info()
+    task_status = task_info["status"]
 
     # Header
     st.markdown("""
         <div class="main-header">
             <h1>📍 Batch Geocoding Studio (No Credit Card Required)</h1>
-            <p>Geocoding massal (hingga 20.000+ baris) cepat, aman, dan tanpa biaya kartu kredit menggunakan Geoapify API & OpenStreetMap.</p>
+            <p>Geocoding massal cepat, aman di background, dan tanpa biaya kartu kredit menggunakan Geoapify API & OpenStreetMap.</p>
         </div>
     """, unsafe_allow_html=True)
 
-    # Sidebar Options
+    # -------------------------------------------------------------
+    # CASE 1: TASK IS RUNNING OR STOPPING IN BACKGROUND
+    # -------------------------------------------------------------
+    if task_status in ("running", "stopping"):
+        # Sidebar in Running Mode
+        with st.sidebar:
+            st.header("⚙️ Konfigurasi Geocoding")
+            st.markdown("""
+                <div class="info-box" style="border-color: #38BDF8; color: #38BDF8; background: rgba(56, 189, 248, 0.1);">
+                    <b>⚡ Proses Sedang Berjalan</b><br>
+                    Konfigurasi dikunci selama geocoding berlangsung di background.
+                </div>
+            """, unsafe_allow_html=True)
+            st.write(f"**🌐 Provider:** {task_info['provider']}")
+            st.write(f"**📄 File:** {task_info['filename']}")
+            st.write(f"**🎯 Kolom Alamat:** {task_info['address_col']}")
+            if task_info["provider"] == "OpenStreetMap (Nominatim)":
+                st.write(f"**⏱️ Delay OSM:** {task_info['delay_seconds']} detik/request")
+                st.write("**⚡ Workers:** 1 Worker")
+            else:
+                st.write(f"**⚡ Workers:** {task_info['max_workers']} Concurrent Threads")
+                st.write("**⏱️ Delay:** Tanpa Delay (Maksimal API Speed)")
+            st.divider()
+            st.caption("🔒 **Keamanan**: Data diproses secara lokal pada mesin Anda.")
+
+        badge_html = '<span class="badge-running">● RUNNING BACKGROUND</span>' if task_status == "running" else '<span class="badge-stopping">● STOPPING...</span>'
+        st.subheader("⚡ Monitoring Geocoding Real-Time")
+        st.markdown(f"""
+            <div style="margin-bottom: 12px; color: #CBD5E1; font-size: 0.95rem;">
+                <b>File:</b> <code>{task_info['filename']}</code> &nbsp;|&nbsp; 
+                <b>Provider:</b> <code>{task_info['provider']}</code> &nbsp;|&nbsp; 
+                <b>Kolom Alamat:</b> <code>{task_info['address_col']}</code>
+                {badge_html}
+            </div>
+        """, unsafe_allow_html=True)
+
+        render_running_dashboard(task_mgr)
+        return
+
+    # -------------------------------------------------------------
+    # CASE 2: TASK COMPLETED
+    # -------------------------------------------------------------
+    if task_status == "completed":
+        st.success("🎉 **Batch Geocoding Selesai 100%!** Seluruh baris telah selesai diproses.")
+
+        metrics = task_info["metrics"]
+        st.markdown(f"""
+        <div class="metric-container">
+            <div class="metric-card">
+                <div class="metric-title">Total Baris</div>
+                <div class="metric-value">{metrics['total']:,}</div>
+                <div class="metric-subtitle">100% Selesai</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Sukses Ditemukan</div>
+                <div class="metric-value status-success">{metrics['success']:,}</div>
+                <div class="metric-subtitle">Koordinat Valid</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Gagal / Kosong</div>
+                <div class="metric-value status-failed">{metrics['failed']:,}</div>
+                <div class="metric-subtitle">Tidak Terindeks</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Kecepatan Rata-Rata</div>
+                <div class="metric-value status-speed">{metrics['speed']}</div>
+                <div class="metric-subtitle">Baris / Detik</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Total Waktu</div>
+                <div class="metric-value status-eta">{metrics['elapsed']}s</div>
+                <div class="metric-subtitle">Durasi Proses</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_btn1, col_btn2 = st.columns([2, 5])
+        with col_btn1:
+            if st.button("🔄 Mulai Batch Baru / Unggah File Lain", type="primary", use_container_width=True):
+                task_mgr.reset_task()
+                st.rerun(scope="app")
+
+        if task_info["df"] is not None:
+            render_results_section(task_info["df"], subtitle="Hasil lengkap batch geocoding yang telah selesai.")
+        return
+
+    # -------------------------------------------------------------
+    # CASE 3: TASK STOPPED BY USER
+    # -------------------------------------------------------------
+    if task_status == "stopped":
+        st.warning("⚠️ **Batch Geocoding Dihentikan oleh Pengguna.**")
+        st.info("💡 Data progres yang telah selesai tersimpan aman di file checkpoint. Anda dapat melanjutkan proses kapan saja.")
+
+        metrics = task_info["metrics"]
+        st.markdown(f"""
+        <div class="metric-container">
+            <div class="metric-card">
+                <div class="metric-title">Baris Selesai</div>
+                <div class="metric-value">{metrics['processed']:,} / {metrics['total']:,}</div>
+                <div class="metric-subtitle">{metrics['percentage']}% Selesai</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Sukses Ditemukan</div>
+                <div class="metric-value status-success">{metrics['success']:,}</div>
+                <div class="metric-subtitle">Koordinat Valid</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Gagal / Kosong</div>
+                <div class="metric-value status-failed">{metrics['failed']:,}</div>
+                <div class="metric-subtitle">Tidak Terindeks</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Kecepatan Terakhir</div>
+                <div class="metric-value status-speed">{metrics['speed']}</div>
+                <div class="metric-subtitle">Baris / Detik</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-title">Status Checkpoint</div>
+                <div class="metric-value status-eta">Tersimpan</div>
+                <div class="metric-subtitle">Siap Dilanjutkan</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_act1, col_act2, col_dummy = st.columns([2, 2, 3])
+        with col_act1:
+            if st.button("▶️ Lanjutkan Geocoding (Resume)", type="primary", use_container_width=True):
+                task_mgr.resume_task()
+                st.rerun(scope="app")
+        with col_act2:
+            if st.button("🔄 Reset / Ganti File Baru", type="secondary", use_container_width=True):
+                task_mgr.reset_task()
+                st.rerun(scope="app")
+
+        if task_info["df"] is not None:
+            render_results_section(task_info["df"], subtitle="Hasil data yang sempat terproses sebelum dihentikan.")
+        return
+
+    # -------------------------------------------------------------
+    # CASE 4: TASK ERROR
+    # -------------------------------------------------------------
+    if task_status == "error":
+        st.error(f"❌ Terjadi kesalahan saat memproses geocoding: {task_info['error_message']}")
+        if st.button("🔄 Reset Status", type="primary"):
+            task_mgr.reset_task()
+            st.rerun(scope="app")
+        return
+
+    # -------------------------------------------------------------
+    # CASE 5: IDLE (Standard Setup & Upload Screen)
+    # -------------------------------------------------------------
+    # Sidebar Configuration
     with st.sidebar:
         st.header("⚙️ Konfigurasi Geocoding")
 
@@ -183,7 +523,6 @@ def main():
         else:
             st.info("💡 **OpenStreetMap (Nominatim)**: 100% Gratis & Tanpa API Key.")
             
-            # Slider Delay per request untuk Nominatim
             delay_seconds = st.slider(
                 "⏱️ Delay Per Request (Detik)",
                 min_value=1.0,
@@ -212,7 +551,7 @@ def main():
                 min_value=1,
                 max_value=20,
                 value=5,
-                help="Jumlah worker thread sejajar. Rekomendasi 3 - 10 thread untuk Geoapify."
+                help="Jumlah worker thread sejajar. Rekomendasi 3 - 10 thread untuk Geoapify (Tanpa delay)."
             )
 
         checkpoint_interval = st.selectbox(
@@ -225,13 +564,21 @@ def main():
         st.divider()
         st.caption("🔒 **Keamanan**: Data dan API Key diproses secara lokal di sistem Anda.")
 
-    # Provider Warnings / Banners
+    # Provider Tips Banner
     if provider_choice == "OpenStreetMap (Nominatim)":
         st.markdown(f"""
             <div class="info-box">
-                <b>💡 Tips OpenStreetMap (Nominatim):</b><br>
-                Delay antar request saat ini diatur ke <b>{delay_seconds} detik</b> per data untuk menjaga IP Anda aman dari blokir (HTTP 429).<br>
-                Untuk data massal skala besar (>500 baris) dengan kecepatan tinggi, Anda dapat berpindah ke <b>Geoapify API</b> (Gratis 3.000/hari tanpa kartu kredit).
+                <b>💡 Mode OpenStreetMap (Nominatim):</b><br>
+                Delay per request diatur ke <b>{delay_seconds} detik</b> untuk mematuhi OSM Usage Policy & mencegah blokir IP (HTTP 429).<br>
+                Untuk kecepatan tinggi tanpa jeda buatan, Anda dapat menggunakan <b>Geoapify API</b> (Gratis 3.000 req/hari tanpa kartu kredit).
+            </div>
+        """, unsafe_allow_html=True)
+    elif provider_choice == "Geoapify":
+        st.markdown(f"""
+            <div class="info-box" style="background: rgba(34, 197, 94, 0.1); border-color: rgba(34, 197, 94, 0.3); color: #86EFAC;">
+                <b>⚡ Mode Kecepatan Tinggi (Geoapify):</b><br>
+                Geoapify memproses data secara paralel menggunakan <b>{max_workers} thread bersamaan tanpa delay buatan</b>.<br>
+                Proses berjalan aman di background dan dapat di-refresh sewaktu-waktu.
             </div>
         """, unsafe_allow_html=True)
 
@@ -259,7 +606,7 @@ def main():
                         os.remove(checkpoint_file)
                         st.success("File checkpoint lama berhasil dihapus!")
                         time.sleep(1)
-                        st.rerun()
+                        st.rerun(scope="app")
                     except Exception as e:
                         st.error(f"Gagal menghapus checkpoint: {e}")
 
@@ -272,21 +619,22 @@ def main():
     )
 
     df = None
+    uploaded_name = ""
     if uploaded_file is not None:
         try:
-            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+            uploaded_name = uploaded_file.name
+            file_ext = os.path.splitext(uploaded_name)[1].lower()
             if file_ext == ".csv":
                 df = pd.read_csv(uploaded_file)
             else:
                 df = pd.read_excel(uploaded_file)
-            st.session_state.df_loaded = df
         except Exception as e:
             st.error(f"Error membaca file: {e}")
             return
     elif resume_checkpoint and checkpoint_exists:
         try:
+            uploaded_name = checkpoint_file
             df = pd.read_csv(checkpoint_file)
-            st.session_state.df_loaded = df
             st.info(f"Menggunakan data dari file checkpoint ({len(df):,} baris).")
         except Exception as e:
             st.error(f"Gagal membaca checkpoint: {e}")
@@ -315,72 +663,23 @@ def main():
 
     st.divider()
 
-    # Execution Section
+    # Execution Trigger Section
     st.subheader("2. Mulai Batch Geocoding")
 
     if provider_choice in ["Geoapify", "HERE Geocoding API"] and not api_key.strip():
         st.warning(f"⚠️ Masukkan API Key {provider_choice} pada sidebar sebelum memulai geocoding.")
         return
 
-    col_btn1, col_btn2, col_btn3 = st.columns([2, 2, 6])
-    start_clicked = col_btn1.button("🚀 Mulai Geocoding", type="primary", use_container_width=True, disabled=st.session_state.is_processing)
-    stop_clicked = col_btn2.button("🛑 Hentikan Proses", type="secondary", use_container_width=True, disabled=not st.session_state.is_processing)
-
-    if stop_clicked and st.session_state.geocoder_engine:
-        st.session_state.geocoder_engine.stop()
-        st.session_state.is_processing = False
-        st.warning("Proses dihentikan oleh pengguna.")
-
-    progress_bar_placeholder = st.empty()
-    metrics_placeholder = st.empty()
-    status_text_placeholder = st.empty()
-
-    def update_ui_metrics(metrics: dict):
-        """Callback to dynamically update Streamlit UI components."""
-        pct = metrics["percentage"]
-        processed = metrics["processed"]
-        total = metrics["total"]
-        success = metrics["success"]
-        failed = metrics["failed"]
-        speed = metrics["speed"]
-        eta = metrics["eta"]
-
-        progress_bar_placeholder.progress(pct / 100.0, text=f"Kemajuan: {pct:.1f}% ({processed:,} / {total:,} baris)")
-
-        metrics_html = f"""
-        <div class="metric-container">
-            <div class="metric-card">
-                <div class="metric-title">Baris Diproses</div>
-                <div class="metric-value">{processed:,} / {total:,}</div>
-                <div class="metric-subtitle">{pct:.1f}% Selesai</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-title">Sukses Ditemukan</div>
-                <div class="metric-value status-success">{success:,}</div>
-                <div class="metric-subtitle">Koordinat Valid</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-title">Gagal / Kosong</div>
-                <div class="metric-value status-failed">{failed:,}</div>
-                <div class="metric-subtitle">Gagal Geocode</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-title">Kecepatan</div>
-                <div class="metric-value status-speed">{speed}</div>
-                <div class="metric-subtitle">Baris / Detik</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-title">Estimasi Sisa Waktu (ETA)</div>
-                <div class="metric-value status-eta">{eta}</div>
-                <div class="metric-subtitle">Format J:M:S / M:S</div>
-            </div>
-        </div>
-        """
-        metrics_placeholder.markdown(metrics_html, unsafe_allow_html=True)
+    col_btn1, col_btn2 = st.columns([2, 5])
+    with col_btn1:
+        start_clicked = st.button(
+            "🚀 Mulai Geocoding (Background)",
+            type="primary",
+            use_container_width=True
+        )
 
     if start_clicked:
-        st.session_state.is_processing = True
-        engine = BatchGeocoderEngine(
+        task_mgr.start_task(
             df=df,
             address_col=address_col,
             provider=provider_choice,
@@ -388,70 +687,10 @@ def main():
             delay_seconds=delay_seconds,
             max_workers=max_workers,
             checkpoint_interval=checkpoint_interval,
-            resume_from_checkpoint=resume_checkpoint
+            resume_from_checkpoint=resume_checkpoint,
+            filename=uploaded_name
         )
-        st.session_state.geocoder_engine = engine
-
-        status_text_placeholder.info(f"⏳ Memproses geocoding dengan provider **{provider_choice}** (Delay: {delay_seconds}s per data)...")
-
-        result_df = engine.process_batch(progress_callback=update_ui_metrics)
-        st.session_state.geocoded_df = result_df
-        st.session_state.is_processing = False
-
-        if engine.stop_requested:
-            status_text_placeholder.warning("⚠️ Proses dihentikan sebelum selesai. Progres tersimpan aman di file checkpoint.")
-        else:
-            status_text_placeholder.success("🎉 Batch Geocoding Selesai 100%!")
-
-    # Display Results & Downloads
-    current_result_df = st.session_state.geocoded_df if st.session_state.geocoded_df is not None else (
-        df if "Latitude" in df.columns and "Longitude" in df.columns else None
-    )
-
-    if current_result_df is not None:
-        st.divider()
-        st.subheader("3. Hasil & Unduh File Output")
-
-        col_dl1, col_dl2 = st.columns([1, 1])
-        with col_dl1:
-            csv_data = convert_df_to_csv(current_result_df)
-            st.download_button(
-                label="📥 Unduh Hasil Format CSV (.csv)",
-                data=csv_data,
-                file_name="hasil_geocoding.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-
-        with col_dl2:
-            try:
-                excel_data = convert_df_to_excel(current_result_df)
-                st.download_button(
-                    label="📊 Unduh Hasil Format Excel (.xlsx)",
-                    data=excel_data,
-                    file_name="hasil_geocoding.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-            except Exception as e:
-                st.error(f"Gagal menyiapkan file Excel: {e}")
-
-        tab_t, tab_m = st.tabs(["📋 Tabel Hasil Geocoding", "🗺️ Visualisasi Peta"])
-
-        with tab_t:
-            st.dataframe(current_result_df, use_container_width=True)
-
-        with tab_m:
-            valid_coords = current_result_df.dropna(subset=["Latitude", "Longitude"]).copy()
-            valid_coords["latitude"] = pd.to_numeric(valid_coords["Latitude"], errors='coerce')
-            valid_coords["longitude"] = pd.to_numeric(valid_coords["Longitude"], errors='coerce')
-            valid_coords = valid_coords.dropna(subset=["latitude", "longitude"])
-
-            if not valid_coords.empty:
-                st.write(f"Menampilkan **{len(valid_coords):,} titik lokasi** sukses pada peta:")
-                st.map(valid_coords[["latitude", "longitude"]], zoom=5)
-            else:
-                st.info("Belum ada koordinat valid untuk ditampilkan pada peta.")
+        st.rerun(scope="app")
 
 
 if __name__ == "__main__":
