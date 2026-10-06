@@ -120,7 +120,7 @@ st.markdown("""
         border-radius: 10px;
         padding: 14px 18px;
         margin-bottom: 16px;
-        color: #FEF08A;
+        color: #7f7215;
     }
 
     .badge-running {
@@ -759,7 +759,7 @@ def main():
         """, unsafe_allow_html=True)
     elif provider_choice == "Geoapify":
         st.markdown(f"""
-            <div class="info-box" style="background: rgba(34, 197, 94, 0.1); border-color: rgba(34, 197, 94, 0.3); color: #86EFAC;">
+            <div class="info-box" style="background: rgba(34, 197, 94, 0.1); border-color: rgba(34, 197, 94, 0.3); color: rgb(21 112 54);">
                 <b>⚡ Mode Kecepatan Tinggi (Geoapify):</b><br>
                 Geoapify memproses data secara paralel menggunakan <b>{max_workers} thread bersamaan tanpa delay buatan</b>.<br>
                 Proses berjalan aman di background dan dapat di-refresh sewaktu-waktu.
