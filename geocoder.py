@@ -38,26 +38,94 @@ def rate_limit_nominatim(delay_seconds: float = 3.0):
 def clean_address_for_search(address: str) -> str:
     """
     Cleans and normalizes Indonesian addresses for higher geocoding match rates.
-    Expands common abbreviations (Jl. -> Jalan) and strips noise (No. xx, RT/RW, Lantai, etc.).
+    Expands common abbreviations (Jl. -> Jalan) and strips administrative noise
+    (DESA/KELURAHAN, KECAMATAN, KABUPATEN, RT/RW, No. xx, Lantai, etc.).
     """
-    if not address:
+    if not address or not isinstance(address, str):
         return ""
     
     text = address.strip()
-    text = re.sub(r'(?i)\bjl\.?\b', 'Jalan ', text)
-    text = re.sub(r'(?i)\bgd\.?\b|\bged\.?\b', 'Gedung ', text)
-    text = re.sub(r'(?i)\bkav\.?\b', 'Kavling ', text)
-    text = re.sub(r'(?i)\bjend\.?\b|\bjendral\b', 'Jenderal ', text)
-    text = re.sub(r'(?i)\bkec\.?\b', '', text)
-    text = re.sub(r'(?i)\bkel\.?\b', '', text)
     
-    text = re.sub(r'(?i)\bno\.?\s*\d+\w*', '', text)
-    text = re.sub(r'(?i)\b(rt|rw)\.?\s*\d+', '', text)
-    text = re.sub(r'(?i)\blt\.?\s*\d+|\blantai\s*\d+', '', text)
-    text = re.sub(r'(?i)\bblok\s*\w+', '', text)
+    # Strip administrative noise prefixes while preserving the name
+    text = re.sub(r'(?i)\bDESA/KELURAHAN\b', '', text)
+    text = re.sub(r'(?i)\b(DESA|KELURAHAN|KEL|KECAMATAN|KEC|KABUPATEN|KAB|PROVINSI|PROV)\b\.?', '', text)
     
+    # Standardize street abbreviations
+    text = re.sub(r'(?i)\b(JL|JLN)\b\.?', 'Jalan', text)
+    text = re.sub(r'(?i)\b(GD|GED)\b\.?', 'Gedung', text)
+    text = re.sub(r'(?i)\bKAV\b\.?', 'Kavling', text)
+    text = re.sub(r'(?i)\b(JEND|JENDRAL)\b\.?', 'Jenderal', text)
+    text = re.sub(r'(?i)\bGG\b\.?', '', text)
+    
+    # Strip RT/RW, No., Floor, Block
+    text = re.sub(r'(?i)\b(RT|RW)\b\.?\s*\d+', '', text)
+    text = re.sub(r'(?i)\bNO\b\.?\s*\d+\w*', '', text)
+    text = re.sub(r'(?i)\b(LT|LANTAI)\b\.?\s*\d+', '', text)
+    text = re.sub(r'(?i)\bBLOK\b\s*\w+', '', text)
+    
+    # Clean leftover dots, commas, spaces
+    text = re.sub(r'\s*\.\s*', ' ', text)
+    text = re.sub(r'\s*,\s*', ', ', text)
     text = re.sub(r'\s+', ' ', text).strip(' ,.-')
     return text
+
+
+def build_here_query_chain(address: str) -> list:
+    """
+    Builds a dynamic fallback chain of search queries from an address string.
+    Dynamically respects the user's data (whether from Kalimantan Timur, Jawa, Bali, etc.)
+    without hardcoding any province name.
+    """
+    if not address or not isinstance(address, str):
+        return []
+        
+    queries = []
+    cleaned = clean_address_for_search(address)
+    
+    # 1. Cleaned full address + ', Indonesia'
+    if cleaned:
+        q1 = f"{cleaned}, Indonesia"
+        if q1 not in queries:
+            queries.append(q1)
+            
+    # Extract segments separated by comma
+    raw_segments = [s.strip() for s in address.split(',') if s.strip()]
+    cleaned_segments = [clean_address_for_search(s) for s in raw_segments]
+    cleaned_segments = [s for s in cleaned_segments if s]
+    
+    dedup_segments = []
+    for seg in cleaned_segments:
+        if not dedup_segments or dedup_segments[-1].lower() != seg.lower():
+            dedup_segments.append(seg)
+            
+    # Step 2: Last 3 segments (Village, District, Regency) + ', Indonesia'
+    if len(dedup_segments) >= 3:
+        q2 = f"{', '.join(dedup_segments[-3:])}, Indonesia"
+        if q2 not in queries:
+            queries.append(q2)
+            
+    # Step 3: Last 2 segments (District, Regency) + ', Indonesia'
+    if len(dedup_segments) >= 2:
+        q3 = f"{', '.join(dedup_segments[-2:])}, Indonesia"
+        if q3 not in queries:
+            queries.append(q3)
+            
+    # Step 4: Last segment (Regency/City) + ', Indonesia'
+    if len(dedup_segments) >= 1:
+        q4 = f"{dedup_segments[-1]}, Indonesia"
+        if q4 not in queries:
+            queries.append(q4)
+            
+    # Step 5: Raw address + ', Indonesia'
+    q_raw = f"{address.strip()}, Indonesia"
+    if q_raw not in queries:
+        queries.append(q_raw)
+        
+    # Step 6: Raw address as last resort
+    if address.strip() not in queries:
+        queries.append(address.strip())
+        
+    return queries
 
 
 def geocode_geoapify(
@@ -173,32 +241,57 @@ def geocode_here(
     api_key: str, 
     timeout: float = 6.0
 ) -> Tuple[Optional[float], Optional[float], str]:
-    """Geocodes an address using HERE Geocoding API."""
+    """
+    Geocodes an address using HERE Geocoding API with dynamic Indonesian fallback query chain,
+    countryCode filtering (IDN), rate-limit retry backoff, and robust error handling.
+    """
     session = get_session()
     url = "https://geocode.search.hereapi.com/v1/geocode"
-    params = {
-        "q": address,
-        "apiKey": api_key,
-        "limit": 1
-    }
-    try:
-        res = session.get(url, params=params, timeout=timeout)
-        if res.status_code == 200:
-            items = res.json().get("items", [])
-            if items:
-                pos = items[0].get("position", {})
-                return float(pos.get("lat")), float(pos.get("lng")), "success"
-            return None, None, "not_found"
-        elif res.status_code in (401, 403):
-            return None, None, "invalid_api_key"
-        elif res.status_code == 429:
-            return None, None, "rate_limited"
-        else:
-            return None, None, f"http_{res.status_code}"
-    except requests.exceptions.ConnectionError:
-        return None, None, "network_dns_error"
-    except Exception as e:
-        return None, None, f"error_{str(e)}"
+    
+    queries_to_try = build_here_query_chain(address)
+    if not queries_to_try:
+        queries_to_try = [address]
+        
+    last_status = "not_found"
+    
+    for q in queries_to_try:
+        params = {
+            "q": q,
+            "apiKey": api_key,
+            "limit": 1,
+            "in": "countryCode:IDN"
+        }
+        for attempt in range(3):
+            try:
+                res = session.get(url, params=params, timeout=timeout)
+                if res.status_code == 200:
+                    items = res.json().get("items", [])
+                    if items:
+                        pos = items[0].get("position", {})
+                        return float(pos.get("lat")), float(pos.get("lng")), "success"
+                    last_status = "not_found"
+                    break
+                elif res.status_code in (401, 403):
+                    return None, None, "invalid_api_key"
+                elif res.status_code == 429:
+                    last_status = "rate_limited"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                else:
+                    last_status = f"http_{res.status_code}"
+                    break
+            except requests.exceptions.Timeout:
+                last_status = "network_timeout"
+                time.sleep(1.0)
+            except requests.exceptions.ConnectionError:
+                if attempt < 2:
+                    time.sleep(1.0)
+                    continue
+                return None, None, "network_dns_error"
+            except Exception as e:
+                return None, None, f"error_{str(e)}"
+                
+    return None, None, last_status
 
 
 def geocode_single_address(
@@ -310,6 +403,19 @@ class BatchGeocoderEngine:
         """Returns the most recent geocoded address activities."""
         with self.lock:
             return list(self.recent_logs)
+
+    def get_valid_coordinates_dataframe(self, max_points: Optional[int] = None) -> pd.DataFrame:
+        """Thread-safely extracts rows that have successfully found coordinates."""
+        with self.lock:
+            mask = (self.df["Geocode_Status"] == "success") & self.df["Latitude"].notna() & self.df["Longitude"].notna()
+            if not mask.any():
+                return pd.DataFrame()
+            cols = [self.address_col, "Latitude", "Longitude"]
+            sub_df = self.df.loc[mask, cols].copy()
+            sub_df["row_index"] = sub_df.index + 1
+            if max_points and len(sub_df) > max_points:
+                sub_df = sub_df.tail(max_points)
+            return sub_df
 
     def load_checkpoint(self):
         """Loads state from existing checkpoint file."""
@@ -591,6 +697,41 @@ class GeocodeTaskManager:
                 self.df_result = None
                 self.start_time = None
                 self.end_time = None
+
+    def get_valid_points(self, max_points: Optional[int] = None) -> pd.DataFrame:
+        """Thread-safely returns currently geocoded valid points for map rendering."""
+        with self.lock:
+            engine = self.engine
+            df_result = self.df_result
+            address_col = self.address_col
+
+        if engine is not None:
+            if hasattr(engine, "get_valid_coordinates_dataframe"):
+                return engine.get_valid_coordinates_dataframe(max_points=max_points)
+            else:
+                with engine.lock:
+                    mask = (engine.df["Geocode_Status"] == "success") & engine.df["Latitude"].notna() & engine.df["Longitude"].notna()
+                    if not mask.any():
+                        return pd.DataFrame()
+                    cols = [address_col, "Latitude", "Longitude"] if address_col in engine.df.columns else ["Latitude", "Longitude"]
+                    sub_df = engine.df.loc[mask, cols].copy()
+                    sub_df["row_index"] = sub_df.index + 1
+                    if max_points and len(sub_df) > max_points:
+                        sub_df = sub_df.tail(max_points)
+                    return sub_df
+        elif df_result is not None and "Latitude" in df_result.columns and "Longitude" in df_result.columns:
+            mask = (df_result["Geocode_Status"] == "success") & df_result["Latitude"].notna() & df_result["Longitude"].notna()
+            if not mask.any():
+                return pd.DataFrame()
+            cols = [address_col, "Latitude", "Longitude"] if address_col in df_result.columns else ["Latitude", "Longitude"]
+            sub_df = df_result.loc[mask, cols].copy()
+            sub_df["row_index"] = sub_df.index + 1
+            if address_col not in sub_df.columns:
+                sub_df[address_col] = "Alamat"
+            if max_points and len(sub_df) > max_points:
+                sub_df = sub_df.tail(max_points)
+            return sub_df
+        return pd.DataFrame()
 
     def get_info(self) -> Dict[str, Any]:
         with self.lock:

@@ -1,0 +1,34 @@
+# Python Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+
+# Python Bytecode & Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Datasets & Outputs (Excel & CSV)
+*.csv
+*.xlsx
+*.xls
+!sample_data.csv
+
+# Microsoft Excel Temporary Lock Files
+~$*.xlsx
+~$*.xls
+
+# Environment Variables & API Keys
+.env
+*.env
+
+# IDE & OS Specific Files
+.DS_Store
+.vscode/
+.idea/
+
+# Streamlit Local Configurations
+.streamlit/secrets.toml

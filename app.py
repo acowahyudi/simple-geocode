@@ -1,8 +1,13 @@
 import os
 import io
 import time
+import types
+import importlib
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
+import geocoder
+importlib.reload(geocoder)
 from geocoder import (
     BatchGeocoderEngine,
     GeocodeTaskManager,
@@ -21,6 +26,15 @@ st.set_page_config(
 @st.cache_resource
 def get_global_task_manager() -> GeocodeTaskManager:
     return GeocodeTaskManager()
+
+def get_active_task_manager() -> GeocodeTaskManager:
+    mgr = get_global_task_manager()
+    # Auto-repair cached instance if modified in geocoder.py during live reload
+    for attr in dir(GeocodeTaskManager):
+        if not attr.startswith("__") and callable(getattr(GeocodeTaskManager, attr)):
+            if not hasattr(mgr, attr) or getattr(mgr.__class__, attr, None) is None:
+                setattr(mgr, attr, types.MethodType(getattr(GeocodeTaskManager, attr), mgr))
+    return mgr
 
 # Custom Styling (Dark/Light Responsive Modern Interface)
 st.markdown("""
@@ -54,13 +68,13 @@ st.markdown("""
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
         gap: 16px;
-        margin-bottom: 24px;
+        margin-bottom: 20px;
     }
     .metric-card {
         background: #1E293B;
         border: 1px solid #334155;
         border-radius: 12px;
-        padding: 18px 20px;
+        padding: 16px 18px;
         text-align: center;
         transition: transform 0.2s ease, border-color 0.2s ease;
     }
@@ -69,7 +83,7 @@ st.markdown("""
         transform: translateY(-2px);
     }
     .metric-title {
-        font-size: 0.85rem;
+        font-size: 0.82rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.05em;
@@ -77,12 +91,12 @@ st.markdown("""
         margin-bottom: 6px;
     }
     .metric-value {
-        font-size: 1.8rem;
+        font-size: 1.7rem;
         font-weight: 700;
         color: #F8FAFC;
     }
     .metric-subtitle {
-        font-size: 0.8rem;
+        font-size: 0.78rem;
         color: #64748B;
         margin-top: 4px;
     }
@@ -141,8 +155,8 @@ st.markdown("""
         border: 1px solid #334155;
         border-radius: 10px;
         padding: 12px 16px;
-        margin-top: 14px;
-        margin-bottom: 20px;
+        margin-top: 10px;
+        margin-bottom: 14px;
     }
     
     .activity-item {
@@ -178,11 +192,89 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-@st.fragment(run_every="1s")
+def render_interactive_map(points_df: pd.DataFrame, address_col: str, height: int = 480):
+    """
+    Renders an interactive map using PyDeck with dark styling, 
+    responsive pins, and rich hover tooltips for cross-checking accuracy.
+    """
+    if points_df is None or points_df.empty:
+        st.info("🗺️ Belum ada titik koordinat yang berhasil ditemukan untuk ditampilkan.")
+        return
+
+    plot_df = points_df.copy()
+    plot_df["latitude"] = pd.to_numeric(plot_df["Latitude"], errors="coerce")
+    plot_df["longitude"] = pd.to_numeric(plot_df["Longitude"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["latitude", "longitude"])
+
+    if plot_df.empty:
+        st.info("🗺️ Belum ada koordinat numerik valid untuk ditampilkan.")
+        return
+
+    # Prepare tooltip fields
+    addr_col_name = address_col if address_col in plot_df.columns else plot_df.columns[0]
+    plot_df["formatted_address"] = plot_df[addr_col_name].astype(str)
+    plot_df["row"] = plot_df["row_index"].astype(int) if "row_index" in plot_df.columns else (plot_df.index + 1)
+    plot_df["lat_str"] = plot_df["latitude"].apply(lambda x: f"{x:.5f}")
+    plot_df["lng_str"] = plot_df["longitude"].apply(lambda x: f"{x:.5f}")
+
+    center_lat = float(plot_df["latitude"].median())
+    center_lng = float(plot_df["longitude"].median())
+
+    try:
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=plot_df,
+            get_position=["longitude", "latitude"],
+            get_color=[56, 189, 248, 220],  # Cyan / Light Blue
+            get_radius=5000,
+            radius_min_pixels=6,
+            radius_max_pixels=25,
+            pickable=True,
+            auto_highlight=True,
+        )
+
+        view_state = pdk.ViewState(
+            latitude=center_lat,
+            longitude=center_lng,
+            zoom=5,
+            pitch=0
+        )
+
+        deck = pdk.Deck(
+            layers=[layer],
+            initial_view_state=view_state,
+            map_style=pdk.map_styles.DARK,
+            tooltip={
+                "html": """
+                <div style="font-family: sans-serif; line-height: 1.4;">
+                    <b style="color: #38BDF8;">📍 Baris #{row}</b><br/>
+                    <b>Alamat:</b> {formatted_address}<br/>
+                    <b>Koordinat:</b> {lat_str}, {lng_str}
+                </div>
+                """,
+                "style": {
+                    "backgroundColor": "#0F172A",
+                    "color": "#F8FAFC",
+                    "border": "1px solid #38BDF8",
+                    "fontSize": "12px",
+                    "borderRadius": "8px",
+                    "padding": "10px",
+                    "boxShadow": "0 4px 15px rgba(0,0,0,0.5)"
+                }
+            }
+        )
+
+        st.pydeck_chart(deck, use_container_width=True, height=height)
+    except Exception:
+        # Fallback to standard st.map
+        st.map(plot_df[["latitude", "longitude"]], zoom=5, use_container_width=True)
+
+
+@st.fragment(run_every="2s")
 def render_running_dashboard(task_mgr: GeocodeTaskManager):
     """
-    Real-time progress dashboard rendered every 1 second without full page reload.
-    Survives browser refresh and updates smoothly.
+    Real-time progress dashboard rendered every 2 seconds without full page reload.
+    Survives browser refresh and updates metrics, map, and activity feed smoothly.
     """
     info = task_mgr.get_info()
     status = info["status"]
@@ -236,24 +328,7 @@ def render_running_dashboard(task_mgr: GeocodeTaskManager):
     """
     st.markdown(metrics_html, unsafe_allow_html=True)
 
-    # Real-Time Activity Feed (Last 6 processed rows)
-    recent_logs = info.get("recent_logs", [])
-    if recent_logs:
-        st.markdown("##### 📡 Aktivitas Geocoding Real-Time (Data Terakhir Diproses)")
-        log_rows_html = ""
-        for item in reversed(recent_logs):
-            badge_color = "#4ADE80" if item["status"] == "success" else "#F87171"
-            log_rows_html += f"""
-            <div class="activity-item">
-                <span style="color: #64748B;">[{item["time"]}]</span> 
-                <b style="color: #38BDF8;">Baris #{item["row"]}:</b> 
-                <span>{item["address"]}</span> 
-                <span style="color: {badge_color}; float: right;">[{item["status"]}] {item["coords"]}</span>
-            </div>
-            """
-        st.markdown(f'<div class="activity-box">{log_rows_html}</div>', unsafe_allow_html=True)
-
-    # Stop Button / Status Note
+    # Stop Button & Background Info
     col_s1, col_s2 = st.columns([2, 5])
     with col_s1:
         if status == "stopping":
@@ -265,11 +340,94 @@ def render_running_dashboard(task_mgr: GeocodeTaskManager):
                 st.rerun(scope="app")
     with col_s2:
         if status == "running":
-            st.caption("💡 *Proses berjalan di background. Anda bebas me-refresh browser atau berpindah tab tanpa kehilangan data!*")
+            st.caption("💡 *Proses berjalan di background. Anda bebas me-refresh browser (F5) tanpa kehilangan progres!*")
+
+    st.write("")
+
+    # Map & Activity Tabs for Live Inspection
+    address_col = info.get("address_col", "Alamat")
+    valid_points_df = pd.DataFrame()
+    if hasattr(task_mgr, "get_valid_points"):
+        try:
+            valid_points_df = task_mgr.get_valid_points()
+        except Exception:
+            pass
+
+    if valid_points_df.empty:
+        curr_df = info.get("df")
+        if curr_df is not None and "Latitude" in curr_df.columns and "Longitude" in curr_df.columns:
+            mask = (curr_df["Geocode_Status"] == "success") & curr_df["Latitude"].notna() & curr_df["Longitude"].notna()
+            if mask.any():
+                cols = [address_col, "Latitude", "Longitude"] if address_col in curr_df.columns else ["Latitude", "Longitude"]
+                valid_points_df = curr_df.loc[mask, cols].copy()
+                valid_points_df["row_index"] = valid_points_df.index + 1
+
+    valid_count = len(valid_points_df)
+
+    tab_map, tab_activity = st.tabs([
+        f"🗺️ Visualisasi Peta Real-Time ({valid_count:,} Titik Sukses)",
+        "📡 Log Aktivitas Real-Time"
+    ])
+
+    with tab_map:
+        if valid_count > 0:
+            st.caption("💡 *Arahkan kursor (*hover*) pada titik di peta untuk melihat alamat lengkap & koordinat. Peta diperbarui secara live.*")
+            render_interactive_map(valid_points_df, address_col=address_col, height=450)
+
+            with st.expander("🔍 Cek Tabel 10 Titik Terakhir (dengan Tautan Langsung ke Google Maps)", expanded=False):
+                last_points = valid_points_df.tail(10).iloc[::-1].copy()
+                check_rows = []
+                for _, row in last_points.iterrows():
+                    r_idx = int(row.get("row_index", 0))
+                    r_addr = str(row.get(address_col, ""))
+                    r_lat = float(row.get("Latitude", 0))
+                    r_lng = float(row.get("Longitude", 0))
+                    gmaps_url = f"https://www.google.com/maps?q={r_lat},{r_lng}"
+                    check_rows.append({
+                        "Baris": f"#{r_idx}",
+                        "Alamat": r_addr,
+                        "Latitude": f"{r_lat:.6f}",
+                        "Longitude": f"{r_lng:.6f}",
+                        "Google Maps": gmaps_url
+                    })
+
+                check_df = pd.DataFrame(check_rows)
+                st.dataframe(
+                    check_df,
+                    column_config={
+                        "Google Maps": st.column_config.LinkColumn(
+                            "Verifikasi Lokasi",
+                            display_text="Buka di Maps ↗"
+                        )
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+        else:
+            st.info("🗺️ **Menunggu koordinat sukses pertama...** Peta akan muncul dan diperbarui secara otomatis begitu ada data yang berhasil digeocode.")
+
+    with tab_activity:
+        recent_logs = info.get("recent_logs", [])
+        if recent_logs:
+            st.markdown("##### 📡 Aktivitas Geocoding Real-Time (Data Terakhir Diproses)")
+            log_rows_html = ""
+            for item in reversed(recent_logs):
+                badge_color = "#4ADE80" if item["status"] == "success" else "#F87171"
+                log_rows_html += f"""
+                <div class="activity-item">
+                    <span style="color: #64748B;">[{item["time"]}]</span> 
+                    <b style="color: #38BDF8;">Baris #{item["row"]}:</b> 
+                    <span>{item["address"]}</span> 
+                    <span style="color: {badge_color}; float: right;">[{item["status"]}] {item["coords"]}</span>
+                </div>
+                """
+            st.markdown(f'<div class="activity-box">{log_rows_html}</div>', unsafe_allow_html=True)
+        else:
+            st.caption("Belum ada log aktivitas.")
 
 
-def render_results_section(df: pd.DataFrame, subtitle: str = ""):
-    """Renders download buttons, table tab, and map tab for completed or stopped results."""
+def render_results_section(df: pd.DataFrame, address_col: str = "", subtitle: str = ""):
+    """Renders download buttons, table tab, and interactive map tab for completed or stopped results."""
     st.divider()
     st.subheader("📊 Hasil & Unduh File Output")
     if subtitle:
@@ -299,27 +457,53 @@ def render_results_section(df: pd.DataFrame, subtitle: str = ""):
         except Exception as e:
             st.error(f"Gagal menyiapkan file Excel: {e}")
 
-    tab_t, tab_m = st.tabs(["📋 Tabel Hasil Geocoding", "🗺️ Visualisasi Peta"])
+    tab_t, tab_m = st.tabs(["📋 Tabel Hasil Geocoding", "🗺️ Visualisasi Peta & Cross-Check"])
 
     with tab_t:
         st.dataframe(df, use_container_width=True)
 
     with tab_m:
         if "Latitude" in df.columns and "Longitude" in df.columns:
-            valid_coords = df.dropna(subset=["Latitude", "Longitude"]).copy()
-            valid_coords["latitude"] = pd.to_numeric(valid_coords["Latitude"], errors='coerce')
-            valid_coords["longitude"] = pd.to_numeric(valid_coords["Longitude"], errors='coerce')
-            valid_coords = valid_coords.dropna(subset=["latitude", "longitude"])
+            mask = (df["Geocode_Status"] == "success") & df["Latitude"].notna() & df["Longitude"].notna()
+            valid_points = df[mask].copy()
+            valid_count = len(valid_points)
+            if valid_count > 0:
+                st.markdown(f"**Menampilkan {valid_count:,} titik lokasi sukses pada peta interaktif:**")
+                st.caption("💡 *Arahkan kursor (*hover*) pada titik di peta untuk melihat alamat lengkap & koordinat.*")
+                render_interactive_map(valid_points, address_col=address_col or df.columns[0], height=500)
 
-            if not valid_coords.empty:
-                st.write(f"Menampilkan **{len(valid_coords):,} titik lokasi** sukses pada peta:")
-                st.map(valid_coords[["latitude", "longitude"]], zoom=5)
+                with st.expander("🔍 Cek Tabel Lokasi dengan Tautan Google Maps", expanded=False):
+                    check_rows = []
+                    for idx, row in valid_points.head(50).iterrows():
+                        r_addr = str(row.get(address_col, "")) if address_col in row else str(row.iloc[0])
+                        r_lat = float(row.get("Latitude", 0))
+                        r_lng = float(row.get("Longitude", 0))
+                        gmaps_url = f"https://www.google.com/maps?q={r_lat},{r_lng}"
+                        check_rows.append({
+                            "Baris": f"#{idx + 1}",
+                            "Alamat": r_addr,
+                            "Latitude": f"{r_lat:.6f}",
+                            "Longitude": f"{r_lng:.6f}",
+                            "Google Maps": gmaps_url
+                        })
+                    check_df = pd.DataFrame(check_rows)
+                    st.dataframe(
+                        check_df,
+                        column_config={
+                            "Google Maps": st.column_config.LinkColumn(
+                                "Verifikasi Lokasi",
+                                display_text="Buka di Maps ↗"
+                            )
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
             else:
-                st.info("Belum ada koordinat valid untuk ditampilkan pada peta.")
+                st.info("Belum ada koordinat sukses yang valid untuk ditampilkan pada peta.")
 
 
 def main():
-    task_mgr = get_global_task_manager()
+    task_mgr = get_active_task_manager()
     task_info = task_mgr.get_info()
     task_status = task_info["status"]
 
@@ -414,7 +598,7 @@ def main():
                 st.rerun(scope="app")
 
         if task_info["df"] is not None:
-            render_results_section(task_info["df"], subtitle="Hasil lengkap batch geocoding yang telah selesai.")
+            render_results_section(task_info["df"], address_col=task_info["address_col"], subtitle="Hasil lengkap batch geocoding yang telah selesai.")
         return
 
     # -------------------------------------------------------------
@@ -466,7 +650,7 @@ def main():
                 st.rerun(scope="app")
 
         if task_info["df"] is not None:
-            render_results_section(task_info["df"], subtitle="Hasil data yang sempat terproses sebelum dihentikan.")
+            render_results_section(task_info["df"], address_col=task_info["address_col"], subtitle="Hasil data yang sempat terproses sebelum dihentikan.")
         return
 
     # -------------------------------------------------------------
